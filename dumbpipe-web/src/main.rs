@@ -99,9 +99,9 @@ fn bad_request(text: &'static str) -> anyhow::Result<Response<BoxBody<Bytes, hyp
     Ok(resp)
 }
 
-fn parse_subdomain(subdomain: &str) -> anyhow::Result<NodeAddr> {
+fn parse_node_id_or_ticket(id: &str) -> anyhow::Result<NodeAddr> {
     // first try to parse as a node id
-    if let Ok(node_id) = iroh_net::NodeId::from_str(subdomain) {
+    if let Ok(node_id) = iroh_net::NodeId::from_str(id) {
         return Ok(NodeAddr {
             node_id,
             info: AddrInfo {
@@ -111,7 +111,7 @@ fn parse_subdomain(subdomain: &str) -> anyhow::Result<NodeAddr> {
         });
     }
     // then try to parse as a node ticket
-    if let Ok(ticket) = dumbpipe::NodeTicket::from_str(subdomain) {
+    if let Ok(ticket) = dumbpipe::NodeTicket::from_str(id) {
         return Ok(ticket.node_addr().clone());
     }
     Err(anyhow::anyhow!("invalid subdomain"))
@@ -126,16 +126,36 @@ async fn proxy(
         .find(|(name, _value)| name.as_str() == "host")
         .context("missing host header")
         .context(http::StatusCode::BAD_REQUEST)?;
-    let Ok(hostname) = hostname.to_str() else {
-        return bad_request("invalid host header - not ascii");
+    let ticket_header = req
+        .headers()
+        .iter()
+        .find(|(name, _)| name.as_str() == "iroh-ticket")
+        .map(|(_, value)| value);
+
+    let node_addr = if let Some(ticket) = ticket_header {
+        // if iroh-ticket header is provided use that
+        let Ok(ticket) = ticket.to_str() else {
+            return bad_request("invalid iroh-ticket header - not ascii");
+        };
+        let Ok(node_addr) = parse_node_id_or_ticket(ticket) else {
+            return bad_request("invalid iroh-ticket header - ticket is neither a node id nor a ticket");
+        };
+        node_addr
+    } else {
+        // else try to use subdomain provided in the host header
+        let Ok(hostname) = hostname.to_str() else {
+            return bad_request("invalid host header - not ascii");
+        };  
+        let parts = hostname.split('.').collect::<Vec<_>>();
+        if parts.len() < 2 {
+            return bad_request("invalid host header - missing subdomain");
+        }
+        let Ok(node_addr) = parse_node_id_or_ticket(parts[0]) else {
+            return bad_request("invalid host header - subdomain is neither a node id nor a ticket");
+        };
+        node_addr
     };
-    let parts = hostname.split('.').collect::<Vec<_>>();
-    if parts.len() < 2 {
-        return bad_request("invalid host header - missing subdomain");
-    }
-    let Ok(node_addr) = parse_subdomain(parts[0]) else {
-        return bad_request("invalid host header - subdomain is neither a node id nor a ticket");
-    };
+
     tracing::info!("connecting to node: {:?}", node_addr);
     let conn = endpoint().connect(node_addr, dumbpipe::ALPN).await?;
     tracing::info!("opening bi stream");
